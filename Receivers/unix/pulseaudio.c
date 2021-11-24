@@ -1,7 +1,18 @@
 #include "pulseaudio.h"
 
+#include <pulse/def.h>
+#include <pulse/stream.h>
+#include <pulse/thread-mainloop.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <pulse/pulseaudio.h>
+
 static struct pulse_output_data {
-  pa_simple *s;
+  pa_context *c;
+  pa_threaded_mainloop *m;
+  pa_stream *s;
   pa_sample_spec ss;
   pa_channel_map channel_map;
   pa_buffer_attr buffer_attr;
@@ -11,6 +22,79 @@ static struct pulse_output_data {
   char *sink;
   char *stream_name;
 } po_data;
+
+static pa_context_state_t context_state;
+static pa_stream_state_t stream_state;
+
+static void pulse_stream_latency_callback(pa_stream *p, void *userdata) {
+  fprintf(stderr, "Warning: stream latency updated\n");
+}
+
+static void pulse_stream_overflow_callback(pa_stream *p, void *userdata) {
+  pa_threaded_mainloop *m;
+  m = userdata;
+
+  assert(p);
+  assert(m);
+
+  fprintf(stderr, "Warning: buffer overflow\n");
+}
+
+static void pulse_stream_underflow_callback(pa_stream *p, void *userdata) {
+  pa_threaded_mainloop *m;
+  m = userdata;
+
+  assert(p);
+  assert(m);
+
+  fprintf(stderr, "Warning: buffer underflow\n");
+}
+
+static void pulse_stream_notify_callback(pa_stream *p, void *userdata)
+{
+  pa_threaded_mainloop *m;
+  m = userdata;
+
+  assert(p);
+  assert(m);
+
+  stream_state = pa_stream_get_state(p);
+
+  switch(stream_state) {
+    case PA_STREAM_READY:
+      char sample_spec_str[PA_SAMPLE_SPEC_SNPRINT_MAX], channel_map_str[PA_CHANNEL_MAP_SNPRINT_MAX];
+      printf("Sample spec: %s\n", pa_sample_spec_snprint(sample_spec_str, sizeof(sample_spec_str), &po_data.ss));
+      printf("Channel map: %s\n", pa_channel_map_snprint(channel_map_str, sizeof(channel_map_str), &po_data.channel_map));
+      break; 
+    case PA_STREAM_UNCONNECTED:
+    case PA_STREAM_CREATING:
+    case PA_STREAM_FAILED:
+    case PA_STREAM_TERMINATED:
+      break;
+  }
+}
+
+static void pulse_context_notify_callback(pa_context *c, void *userdata)
+{
+  pa_threaded_mainloop *m;
+  m = userdata;
+
+  assert(c);
+  assert(m);
+
+  context_state = pa_context_get_state(c);
+
+  switch(context_state) {
+    case PA_CONTEXT_UNCONNECTED:
+    case PA_CONTEXT_CONNECTING:
+    case PA_CONTEXT_AUTHORIZING:
+    case PA_CONTEXT_SETTING_NAME:
+    case PA_CONTEXT_READY: 
+    case PA_CONTEXT_FAILED:
+    case PA_CONTEXT_TERMINATED:
+      break;
+  }
+}
 
 int pulse_output_init(int latency, char *sink, char *stream_name)
 {
@@ -44,19 +128,65 @@ int pulse_output_init(int latency, char *sink, char *stream_name)
   po_data.buffer_attr.minreq = (uint32_t)-1;
   po_data.buffer_attr.fragsize = (uint32_t)-1;
 
-  po_data.s = pa_simple_new(NULL,
-    "Scream",
-    PA_STREAM_PLAYBACK,
-    po_data.sink,
+  po_data.m = pa_threaded_mainloop_new();
+  if (!po_data.m) {
+    fprintf(stderr, "Unable to create mainloop\n");
+    return 1;
+  }
+
+  po_data.c = pa_context_new(pa_threaded_mainloop_get_api(po_data.m), "Scream");
+  if (!po_data.c) {
+    fprintf(stderr, "Unable to create context: %s\n", pa_strerror(pa_context_errno(po_data.c)));
+    return 1;
+  }
+  pa_context_set_state_callback(po_data.c, &pulse_context_notify_callback, po_data.m);
+  error = pa_context_connect(po_data.c, NULL, PA_CONTEXT_NOFLAGS, NULL);
+  if (error > 0) {
+    fprintf(stderr, "Unable to connect context to PulseAudio server: %s\n", pa_strerror(error));
+    return 1;
+  }
+
+  error = pa_threaded_mainloop_start(po_data.m);
+  if (error < 0) {
+    pa_threaded_mainloop_unlock(po_data.m);
+    fprintf(stderr, "Unable to start PulseAudio mainloop: %s\n", pa_strerror(error));
+    return 1;
+  }
+
+  while(1) {
+    context_state = pa_context_get_state(po_data.c);
+    if (context_state == PA_CONTEXT_READY)
+      break;
+    if (!PA_CONTEXT_IS_GOOD(context_state)) {
+      fprintf(stderr, "Context failed to connec to PulseAudio server: %s\n", pa_strerror(error));
+      return 1;
+    }
+    pa_threaded_mainloop_wait(po_data.m);
+  }
+  po_data.s = pa_stream_new(po_data.c,
     po_data.stream_name,
     &po_data.ss,
-    &po_data.channel_map,
-    &po_data.buffer_attr,
-    &error
+    &po_data.channel_map
   );
   if (!po_data.s) {
-    fprintf(stderr, "Unable to connect to PulseAudio. %s\n", pa_strerror(error));
-    return 1;
+    fprintf(stderr, "Unable to create stream: %s\n", pa_strerror(pa_context_errno(po_data.c)));
+  }
+  pa_stream_set_state_callback(po_data.s, &pulse_stream_notify_callback, po_data.m);
+  pa_stream_set_overflow_callback(po_data.s, pulse_stream_overflow_callback, po_data.m);
+  pa_stream_set_underflow_callback(po_data.s, pulse_stream_underflow_callback, po_data.m);
+  pa_stream_set_latency_update_callback(po_data.s, pulse_stream_latency_callback, po_data.m);
+   error = pa_stream_connect_playback(po_data.s,
+      NULL, 
+      &po_data.buffer_attr,
+      PA_STREAM_VARIABLE_RATE      |
+      PA_STREAM_AUTO_TIMING_UPDATE |
+      PA_STREAM_INTERPOLATE_TIMING |
+      PA_STREAM_ADJUST_LATENCY,
+      NULL,
+      NULL
+  ); 
+  if (error > 0) {
+    fprintf(stderr, "Unable to connect stream to server: %s\n", pa_strerror(error));
   }
 
   return 0;
@@ -65,16 +195,33 @@ int pulse_output_init(int latency, char *sink, char *stream_name)
 void pulse_output_destroy()
 {
   if (po_data.s)
-    pa_simple_free(po_data.s);
+  {
+    pa_stream_disconnect(po_data.s);
+    pa_stream_unref(po_data.s);
+  }
+  if (po_data.c)
+  {
+    pa_context_disconnect(po_data.c);
+    pa_context_unref(po_data.c);
+  }
+  if (po_data.m)
+  {
+    pa_threaded_mainloop_stop(po_data.m);
+    pa_threaded_mainloop_free(po_data.m);
+  }
 }
 
 int pulse_output_send(receiver_data_t *data)
 {
   int error;
 
+  if (po_data.s && !PA_STREAM_IS_GOOD(stream_state))
+    return 1;
+
   receiver_format_t *rf = &data->format;
 
   if (memcmp(&po_data.receiver_format, rf, sizeof(receiver_format_t))) {
+
     // audio format changed, reconfigure
     memcpy(&po_data.receiver_format, rf, sizeof(receiver_format_t));
 
@@ -160,21 +307,39 @@ int pulse_output_send(receiver_data_t *data)
       // sample spec has changed, so the playback buffer size for the requested latency must be recalculated as well
       po_data.buffer_attr.tlength = pa_usec_to_bytes((pa_usec_t)po_data.latency * 1000, &po_data.ss);
 
-      if (po_data.s) pa_simple_free(po_data.s);
-      po_data.s = pa_simple_new(NULL,
-        "Scream",
-        PA_STREAM_PLAYBACK,
-        po_data.sink,
+      if (po_data.s) {
+        pa_stream_disconnect(po_data.s);
+        pa_stream_unref(po_data.s);
+      }
+      while(pa_context_get_state(po_data.c) != PA_CONTEXT_READY)
+        pa_threaded_mainloop_wait(po_data.m);
+      po_data.s = pa_stream_new(po_data.c,
         po_data.stream_name,
         &po_data.ss,
-        &po_data.channel_map,
-        &po_data.buffer_attr,
-        NULL
+        &po_data.channel_map
       );
+      if (!po_data.s) {
+        fprintf(stderr, "Unable to create stream: %s\n", pa_strerror(pa_context_errno(po_data.c)));
+      }
+      pa_stream_set_state_callback(po_data.s, &pulse_stream_notify_callback, po_data.m);
+      pa_stream_set_overflow_callback(po_data.s, pulse_stream_overflow_callback, po_data.m);
+      pa_stream_set_underflow_callback(po_data.s, pulse_stream_underflow_callback, po_data.m);
+      int error = pa_stream_connect_playback(po_data.s,
+          NULL, 
+          &po_data.buffer_attr,
+          PA_STREAM_VARIABLE_RATE      |
+          PA_STREAM_AUTO_TIMING_UPDATE |
+          PA_STREAM_INTERPOLATE_TIMING |
+          PA_STREAM_ADJUST_LATENCY,
+          NULL,
+          NULL
+      ); 
+      if (error < 0) {
+        fprintf(stderr, "Unable to connect stream to server: %s\n", pa_strerror(error));
+      }
       if (po_data.s) {
         printf("Switched format to sample rate %u, sample size %hhu and %u channels.\n", po_data.ss.rate, rf->sample_size, rf->channels);
-      }
-      else {
+      } else {
         printf("Unable to open PulseAudio with sample rate %u, sample size %hhu and %u channels, not playing until next format switch.\n", po_data.ss.rate, rf->sample_size, rf->channels);
         po_data.ss.rate = 0;
       }
@@ -182,8 +347,19 @@ int pulse_output_send(receiver_data_t *data)
   }
 
   if (!po_data.ss.rate) return 0;
-  if (pa_simple_write(po_data.s, data->audio, data->audio_size, &error) < 0) {
-    fprintf(stderr, "pa_simple_write() failed: %s\n", pa_strerror(error));
+  if (stream_state != PA_STREAM_READY) return 0;
+  pa_threaded_mainloop_lock(po_data.m);
+  size_t writable = pa_stream_writable_size(po_data.s);
+  if (writable < 0) return 0;
+  error = pa_stream_write(po_data.s,
+      data->audio,
+      data->audio_size > writable ? writable : data->audio_size,
+      NULL,
+      0,
+      PA_SEEK_RELATIVE);
+  pa_threaded_mainloop_unlock(po_data.m);
+  if (error != 0) {
+    fprintf(stderr, "pa_stream_write() failed: %s\n", pa_strerror(error));
     pulse_output_destroy();
     return 1;
   }
