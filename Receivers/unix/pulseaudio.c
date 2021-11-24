@@ -10,9 +10,11 @@
 #include <pulse/pulseaudio.h>
 
 static struct pulse_output_data {
-  pa_context *c;
   pa_threaded_mainloop *m;
+  pa_context *c;
   pa_stream *s;
+  pa_context_state_t c_state;
+  pa_stream_state_t s_state;
   pa_sample_spec ss;
   pa_channel_map channel_map;
   pa_buffer_attr buffer_attr;
@@ -23,11 +25,7 @@ static struct pulse_output_data {
   char *stream_name;
 } po_data;
 
-static pa_context_state_t context_state;
-static pa_stream_state_t stream_state;
-
 static void pulse_stream_latency_callback(pa_stream *p, void *userdata) {
-  fprintf(stderr, "Warning: stream latency updated\n");
 }
 
 static void pulse_stream_overflow_callback(pa_stream *p, void *userdata) {
@@ -36,8 +34,6 @@ static void pulse_stream_overflow_callback(pa_stream *p, void *userdata) {
 
   assert(p);
   assert(m);
-
-  fprintf(stderr, "Warning: buffer overflow\n");
 }
 
 static void pulse_stream_underflow_callback(pa_stream *p, void *userdata) {
@@ -46,8 +42,6 @@ static void pulse_stream_underflow_callback(pa_stream *p, void *userdata) {
 
   assert(p);
   assert(m);
-
-  fprintf(stderr, "Warning: buffer underflow\n");
 }
 
 static void pulse_stream_notify_callback(pa_stream *p, void *userdata)
@@ -58,9 +52,9 @@ static void pulse_stream_notify_callback(pa_stream *p, void *userdata)
   assert(p);
   assert(m);
 
-  stream_state = pa_stream_get_state(p);
+  po_data.s_state = pa_stream_get_state(p);
 
-  switch(stream_state) {
+  switch(po_data.s_state) {
     case PA_STREAM_READY:
       char sample_spec_str[PA_SAMPLE_SPEC_SNPRINT_MAX], channel_map_str[PA_CHANNEL_MAP_SNPRINT_MAX];
       printf("Sample spec: %s\n", pa_sample_spec_snprint(sample_spec_str, sizeof(sample_spec_str), &po_data.ss));
@@ -82,9 +76,9 @@ static void pulse_context_notify_callback(pa_context *c, void *userdata)
   assert(c);
   assert(m);
 
-  context_state = pa_context_get_state(c);
+  po_data.c_state = pa_context_get_state(c);
 
-  switch(context_state) {
+  switch(po_data.c_state) {
     case PA_CONTEXT_UNCONNECTED:
     case PA_CONTEXT_CONNECTING:
     case PA_CONTEXT_AUTHORIZING:
@@ -154,10 +148,10 @@ int pulse_output_init(int latency, char *sink, char *stream_name)
   }
 
   while(1) {
-    context_state = pa_context_get_state(po_data.c);
-    if (context_state == PA_CONTEXT_READY)
+    po_data.c_state = pa_context_get_state(po_data.c);
+    if (po_data.c_state == PA_CONTEXT_READY)
       break;
-    if (!PA_CONTEXT_IS_GOOD(context_state)) {
+    if (!PA_CONTEXT_IS_GOOD(po_data.c_state)) {
       fprintf(stderr, "Context failed to connec to PulseAudio server: %s\n", pa_strerror(error));
       return 1;
     }
@@ -215,7 +209,7 @@ int pulse_output_send(receiver_data_t *data)
 {
   int error;
 
-  if (po_data.s && !PA_STREAM_IS_GOOD(stream_state))
+  if (po_data.s && !PA_STREAM_IS_GOOD(po_data.s_state))
     return 1;
 
   receiver_format_t *rf = &data->format;
@@ -311,7 +305,7 @@ int pulse_output_send(receiver_data_t *data)
         pa_stream_disconnect(po_data.s);
         pa_stream_unref(po_data.s);
       }
-      while(pa_context_get_state(po_data.c) != PA_CONTEXT_READY)
+      while(po_data.c_state != PA_CONTEXT_READY)
         pa_threaded_mainloop_wait(po_data.m);
       po_data.s = pa_stream_new(po_data.c,
         po_data.stream_name,
@@ -347,7 +341,7 @@ int pulse_output_send(receiver_data_t *data)
   }
 
   if (!po_data.ss.rate) return 0;
-  if (stream_state != PA_STREAM_READY) return 0;
+  if (po_data.s_state != PA_STREAM_READY) return 0;
   pa_threaded_mainloop_lock(po_data.m);
   size_t writable = pa_stream_writable_size(po_data.s);
   if (writable < 0) return 0;
